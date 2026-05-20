@@ -2,15 +2,19 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import copy
+from itertools import chain
 
 from collections import namedtuple, Counter
 from functools import partial
+from numpyro.distributions.transforms import biject_to
 
 from jax import device_put, jacfwd, random, value_and_grad, numpy as jnp, vmap
 from numpyro.handlers import condition, seed, substitute, trace
 from numpyro.infer.initialization import init_to_sample, init_to_uniform
 from numpyro.infer.mcmc import MCMCKernel
 from numpyro.util import is_prng_key
+from types import SimpleNamespace
+import numpyro.distributions as dist
 
 MultiHMCGibbsState = namedtuple("MultiHMCGibbsState", "z, hmc_states, diverging, rng_key, potential_energy")
 """
@@ -78,10 +82,13 @@ class MultiHMCGibbs(MCMCKernel):
                 raise ValueError(f'inner kernel {kdx} does not have the same Numpyro model as kernel 0.')
             k = copy.copy(kernel)
             k._model = partial(_wrap_model, k.model)
-            k._cond_sites = sum(
-                self.gibbs_sites_list[:kdx] + self.gibbs_sites_list[kdx + 1:],
-                []
-            )
+            # k._cond_sites = sum(
+                # self.gibbs_sites_list[:kdx] + self.gibbs_sites_list[kdx + 1:],
+                # []
+            # )
+            k._cond_sites = frozenset(chain.from_iterable(
+                self.gibbs_sites_list[:kdx] + self.gibbs_sites_list[kdx + 1:]
+            ))
             self.inner_kernels.append(k)
         self._prototype_trace = None
         self._sample_fn = None
@@ -158,6 +165,13 @@ class MultiHMCGibbs(MCMCKernel):
                 self._prototype_trace = trace(
                     substitute(seed(self.model, key_zs[0]), substitute_fn=init_to_sample)
                 ).get_trace(*model_args, **model_kwargs)
+
+            self._site_bijectors = {
+                name: biject_to(site["fn"].support)
+                for name, site in self._prototype_trace.items()
+                if site["type"] == "sample" and not site["is_observed"]
+            }
+
             z = {}
             hmc_states = []
             rng_keys = []
@@ -212,12 +226,17 @@ class MultiHMCGibbs(MCMCKernel):
         hmc_states = []
         diverging = []
         rng_keys = []
+
+        z_constrained = {
+            name: self._site_bijectors[name](val)
+            for name, val in z.items()
+            if name in self._site_bijectors
+        }
+
         for hmc_state, kernel in zip(state.hmc_states, self.inner_kernels):
             # convert z to constrained space for conditioning
-            z_constrained = postprocess_fn(z)
-            z_cond_constrained = {
-                k: v for k, v in z_constrained.items() if k in kernel._cond_sites
-            }
+            # z_constrained = postprocess_fn(z)
+            z_cond_constrained = {k: z_constrained[k] for k in kernel._cond_sites}
 
             def potential_fn(z_hmc):
                 return kernel._potential_fn_gen(
@@ -238,6 +257,11 @@ class MultiHMCGibbs(MCMCKernel):
                 model_args,
                 model_kwargs | {'_cond_sites': z_cond_constrained}
             )
+
+            for name, val in hmc_state.z.items():
+                if name in self._site_bijectors:
+                    z_constrained[name] = self._site_bijectors[name](val)
+
             hmc_states.append(hmc_state)
             diverging.append(hmc_state.diverging)
             rng_keys.append(hmc_state.rng_key)
@@ -249,3 +273,109 @@ class MultiHMCGibbs(MCMCKernel):
 
     def sample(self, state, model_args, model_kwargs):
         return self._sample_fn(state, model_args, model_kwargs)
+
+class MultiHMCGibbsWithAnalytic(MultiHMCGibbs):
+
+    def __init__(self, *args, AnalyticTransition=None, **kwargs):
+        MultiHMCGibbs.__init__(self, *args, **kwargs)
+        self.AnalyticTransition = AnalyticTransition
+
+    def init(self, rng_key, num_warmup, init_params, model_args, model_kwargs):
+        state = MultiHMCGibbs.init(
+            self,
+            rng_key,
+            num_warmup,
+            init_params,
+            model_args,
+            model_kwargs,
+        )
+
+        self._site_bijectors = {
+            name: biject_to(site["fn"].support)
+            for name, site in self._prototype_trace.items()
+            if site["type"] == "sample" and not site["is_observed"]
+        }
+
+        return state
+
+    def get_diagnostics_str(self, state):
+        steps, sizes, probs = [], [], []
+        for kernel, s in zip(self.inner_kernels, state.hmc_states):
+            if isinstance(kernel, self.AnalyticTransition):
+                steps.append("analytic")
+                sizes.append("N/A")
+                probs.append("1.")
+            else:
+                steps.append(str(s.num_steps))
+                sizes.append(f"{s.adapt_state.step_size:.2e}")
+                probs.append(f"{s.mean_accept_prob:.2f}")
+        return "{} steps of size {}. acc. prob={}".format(
+            "/".join(steps), "/".join(sizes), "/".join(probs)
+        )
+
+
+    def _sample_one(self, state, model_args, model_kwargs):
+        model_kwargs = {} if model_kwargs is None else model_kwargs
+        postprocess_fn = self.postprocess_fn(model_args, model_kwargs)
+
+        z = state.z
+
+        # ── Build z_constrained from bijectors — zero model evaluations ────────
+        # This is correct for sample sites (all that NUTS conditioning needs).
+        # Deterministic sites (e.g. coeff) are intentionally absent; they are
+        # computed on-demand below for the analytic kernel.
+        z_constrained = {
+            name: self._site_bijectors[name](val)
+            for name, val in z.items()
+            if name in self._site_bijectors
+        }
+
+        hmc_states, diverging, rng_keys = [], [], []
+
+        for hmc_state, kernel in zip(state.hmc_states, self.inner_kernels):
+
+            if isinstance(kernel, self.AnalyticTransition):
+                # ── One full forward pass per sweep, here, with the latest z ──
+                # z now reflects all updates from the NUTS kernels above, so
+                # postprocess_fn produces a fresh coeff from the current z_a.
+                z_constrained_full = postprocess_fn(z)
+                hmc_state = kernel.sample(
+                    hmc_state, model_args, model_kwargs,
+                    z_constrained=z_constrained_full,
+                )
+            else:
+                # ── Iterate over _cond_sites (small set), not all of z ─────────
+                z_cond_constrained = {k: z_constrained[k] for k in kernel._cond_sites}
+
+                def potential_fn(z_hmc, _cond=z_cond_constrained):
+                    return kernel._potential_fn_gen(
+                        *model_args, _cond_sites=_cond, **model_kwargs
+                    )(z_hmc)
+
+                if kernel._forward_mode_differentiation:
+                    pe = potential_fn(hmc_state.z)
+                    z_grad = jacfwd(potential_fn)(hmc_state.z)
+                else:
+                    pe, z_grad = value_and_grad(potential_fn)(hmc_state.z)
+
+                hmc_state = hmc_state._replace(z_grad=z_grad, potential_energy=pe)
+                hmc_state = kernel.sample(
+                    hmc_state, model_args,
+                    model_kwargs | {"_cond_sites": z_cond_constrained},
+                )
+
+                # ── Incremental update: only the sites this kernel changed ──────
+                # Cheap bijector application instead of a full forward pass.
+                for name, val in hmc_state.z.items():
+                    if name in self._site_bijectors:
+                        z_constrained[name] = self._site_bijectors[name](val)
+
+            hmc_states.append(hmc_state)
+            diverging.append(hmc_state.diverging)
+            rng_keys.append(hmc_state.rng_key)
+            z = z | hmc_state.z
+
+        return MultiHMCGibbsState(
+            z, hmc_states, jnp.stack(diverging), jnp.stack(rng_keys),
+            hmc_state.potential_energy,
+        )
